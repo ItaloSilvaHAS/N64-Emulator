@@ -52,4 +52,11 @@ impl Rom {
             entry_point,
         })
     }
+
+    pub fn title(&self) -> String {
+        let title = &self.data[0x20..0x34];
+        String::from_utf8_lossy(title)
+            .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+            .to_string()
+    }
 }
