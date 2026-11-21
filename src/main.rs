@@ -35,8 +35,11 @@ fn main() {
             let mut bus = Bus::new(rom);
             let mut cpu = Cpu::new(bus.rom.entry_point);
 
-            for _ in 0..10 {
-                cpu.step(&mut bus);
+            for step in 0..10 {
+                if let Err(error) = cpu.step(&mut bus) {
+                    eprintln!("CPU parou no passo {}: {error}", step + 1);
+                    break;
+                }
             }
         }
         Err(err) => eprintln!("Erro: {err}"),
