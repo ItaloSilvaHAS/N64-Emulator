@@ -4,7 +4,7 @@ mod library;
 mod rom;
 
 use bus::Bus;
-use cpu::Cpu;
+use cpu::{Cpu, StepOutcome};
 use library::GameLibrary;
 use rom::Rom;
 use std::env;
@@ -36,9 +36,19 @@ fn main() {
             let mut cpu = Cpu::new(bus.rom.entry_point);
 
             for step in 0..10 {
-                if let Err(error) = cpu.step(&mut bus) {
-                    eprintln!("CPU parou no passo {}: {error}", step + 1);
-                    break;
+                match cpu.step(&mut bus) {
+                    Ok(StepOutcome::Executed) => {}
+                    Ok(StepOutcome::Exception { code, vector }) => {
+                        println!(
+                            "CPU entrou na exceção {code:?} no passo {}, vetor 0x{vector:08X}",
+                            step + 1
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("Falha do emulador no passo {}: {error}", step + 1);
+                        break;
+                    }
                 }
             }
         }

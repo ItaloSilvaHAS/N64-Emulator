@@ -7,15 +7,72 @@ pub struct Cpu {
     pub next_pc: u64,
     pub hi: u64,
     pub lo: u64,
+    pub cp0: Cp0,
+    in_delay_slot: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Cp0 {
+    pub bad_vaddr: u64,
+    pub status: u64,
+    pub cause: u64,
+    pub epc: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExceptionCode {
+    AddressLoad = 4,
+    AddressStore = 5,
+    InstructionBusError = 6,
+    DataBusError = 7,
+    Syscall = 8,
+    Breakpoint = 9,
+    ReservedInstruction = 10,
+    ArithmeticOverflow = 12,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    Executed,
+    Exception { code: ExceptionCode, vector: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusAccessKind {
+    InstructionFetch,
+    Load,
+    Store,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CpuError {
-    UnsupportedInstruction { pc: u64, instruction: u32 },
-    ArithmeticOverflow { pc: u64, instruction: u32 },
-    MisalignedMemoryAccess { pc: u64, address: u32, bytes: u8 },
-    MisalignedInstructionFetch { pc: u64 },
-    BusAccess { pc: u64, source: BusError },
+    UnsupportedInstruction {
+        pc: u64,
+        instruction: u32,
+    },
+    ArithmeticOverflow {
+        pc: u64,
+        instruction: u32,
+    },
+    MisalignedMemoryAccess {
+        pc: u64,
+        address: u32,
+        bytes: u8,
+        write: bool,
+    },
+    MisalignedInstructionFetch {
+        pc: u64,
+    },
+    BusAccess {
+        pc: u64,
+        source: BusError,
+        kind: BusAccessKind,
+    },
+    GuestException {
+        pc: u64,
+        code: ExceptionCode,
+    },
 }
 
 impl fmt::Display for CpuError {
@@ -29,15 +86,24 @@ impl fmt::Display for CpuError {
                 formatter,
                 "overflow aritmético na instrução 0x{instruction:08X} no PC 0x{pc:08X}"
             ),
-            Self::MisalignedMemoryAccess { pc, address, bytes } => write!(
+            Self::MisalignedMemoryAccess {
+                pc,
+                address,
+                bytes,
+                write: is_write,
+            } => write!(
                 formatter,
-                "acesso de {bytes} bytes desalinhado no endereço 0x{address:08X}, PC 0x{pc:08X}"
+                "acesso de {} de {bytes} bytes desalinhado no endereço 0x{address:08X}, PC 0x{pc:08X}",
+                if *is_write { "escrita" } else { "leitura" }
             ),
             Self::MisalignedInstructionFetch { pc } => {
                 write!(formatter, "busca de instrução desalinhada no PC 0x{pc:08X}")
             }
-            Self::BusAccess { pc, source } => {
+            Self::BusAccess { pc, source, .. } => {
                 write!(formatter, "falha de barramento no PC 0x{pc:08X}: {source}")
+            }
+            Self::GuestException { pc, code } => {
+                write!(formatter, "exceção {code:?} no PC 0x{pc:08X}")
             }
         }
     }
@@ -54,6 +120,8 @@ impl Cpu {
             next_pc: pc.wrapping_add(4),
             hi: 0,
             lo: 0,
+            cp0: Cp0::default(),
+            in_delay_slot: false,
         }
     }
 
@@ -68,17 +136,100 @@ impl Cpu {
         }
     }
 
-    pub fn step(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+    pub fn step(&mut self, bus: &mut Bus) -> Result<StepOutcome, CpuError> {
+        let instruction_pc = self.pc;
+        let was_in_delay_slot = self.in_delay_slot;
+        match self.execute_instruction(bus) {
+            Ok(()) => Ok(StepOutcome::Executed),
+            Err(error) => {
+                let (code, bad_vaddr) = match &error {
+                    CpuError::UnsupportedInstruction { .. } => {
+                        (ExceptionCode::ReservedInstruction, None)
+                    }
+                    CpuError::ArithmeticOverflow { .. } => {
+                        (ExceptionCode::ArithmeticOverflow, None)
+                    }
+                    CpuError::MisalignedInstructionFetch { pc } => {
+                        (ExceptionCode::AddressLoad, Some(*pc))
+                    }
+                    CpuError::MisalignedMemoryAccess { address, write, .. } => (
+                        if *write {
+                            ExceptionCode::AddressStore
+                        } else {
+                            ExceptionCode::AddressLoad
+                        },
+                        Some(*address as u64),
+                    ),
+                    CpuError::BusAccess { kind, .. } => (
+                        if *kind == BusAccessKind::InstructionFetch {
+                            ExceptionCode::InstructionBusError
+                        } else {
+                            ExceptionCode::DataBusError
+                        },
+                        None,
+                    ),
+                    CpuError::GuestException { code, .. } => (*code, None),
+                };
+                Ok(self.enter_exception(instruction_pc, was_in_delay_slot, code, bad_vaddr))
+            }
+        }
+    }
+
+    fn enter_exception(
+        &mut self,
+        instruction_pc: u64,
+        was_in_delay_slot: bool,
+        code: ExceptionCode,
+        bad_vaddr: Option<u64>,
+    ) -> StepOutcome {
+        const STATUS_EXL: u64 = 1 << 1;
+        const STATUS_BEV: u64 = 1 << 22;
+        const CAUSE_BD: u64 = 1 << 31;
+        const CAUSE_EXCCODE: u64 = 0x1F << 2;
+
+        if self.cp0.status & STATUS_EXL == 0 {
+            self.cp0.epc = if was_in_delay_slot {
+                instruction_pc.wrapping_sub(4)
+            } else {
+                instruction_pc
+            };
+        }
+
+        if let Some(address) = bad_vaddr {
+            self.cp0.bad_vaddr = address;
+        }
+
+        self.cp0.cause &= !(CAUSE_BD | CAUSE_EXCCODE);
+        self.cp0.cause |= (code as u64) << 2;
+        if was_in_delay_slot {
+            self.cp0.cause |= CAUSE_BD;
+        }
+
+        self.cp0.status |= STATUS_EXL;
+        let vector = if self.cp0.status & STATUS_BEV != 0 {
+            0xBFC0_0380
+        } else {
+            0x8000_0180
+        };
+        self.pc = vector as u64;
+        self.next_pc = self.pc.wrapping_add(4);
+        self.in_delay_slot = false;
+
+        StepOutcome::Exception { code, vector }
+    }
+
+    fn execute_instruction(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
         let instruction_pc = self.pc;
         let address = instruction_pc as u32;
         if address % 4 != 0 {
             return Err(CpuError::MisalignedInstructionFetch { pc: instruction_pc });
         }
-        let instruction = bus
-            .read_u32(address)
-            .map_err(|source| bus_access(instruction_pc, source))?;
+        let instruction = bus.read_u32(address).map_err(|source| {
+            bus_access(instruction_pc, source, BusAccessKind::InstructionFetch)
+        })?;
         let next_pc = self.next_pc.wrapping_add(4);
         let mut branch_target = None;
+        let mut has_delay_slot = false;
 
         let opcode = instruction >> 26;
         let rs = ((instruction >> 21) & 0x1F) as usize;
@@ -89,9 +240,11 @@ impl Cpu {
         match opcode {
             0x00 if instruction == 0 => {}
             0x00 => {
+                has_delay_slot = matches!(instruction & 0x3F, 0x08 | 0x09);
                 self.execute_special(instruction, instruction_pc, &mut branch_target)?;
             }
             0x01 => {
+                has_delay_slot = true;
                 let signed_value = self.read_gpr(rs) as i64;
                 let (take_branch, link) = match rt {
                     0x00 => (signed_value < 0, false),  // BLTZ
@@ -108,6 +261,7 @@ impl Cpu {
                 }
             }
             0x02 | 0x03 => {
+                has_delay_slot = true;
                 let target = instruction & 0x03FF_FFFF;
                 branch_target =
                     Some(((instruction_pc.wrapping_add(4)) & 0xF000_0000) | ((target as u64) << 2));
@@ -116,12 +270,14 @@ impl Cpu {
                 }
             }
             0x04 | 0x05 => {
+                has_delay_slot = true;
                 let equal = self.read_gpr(rs) == self.read_gpr(rt);
                 if equal == (opcode == 0x04) {
                     branch_target = Some(branch_address(instruction_pc, immediate));
                 }
             }
             0x06 | 0x07 => {
+                has_delay_slot = true;
                 if rt != 0 {
                     return Err(unsupported(instruction_pc, instruction));
                 }
@@ -171,37 +327,32 @@ impl Cpu {
                     0x37 => 8,
                     _ => unreachable!(),
                 };
-                check_alignment(instruction_pc, address, bytes)?;
-                let value = match opcode {
-                    0x20 => bus
-                        .read_u8(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as i8 as i64 as u64, // LB
-                    0x21 => bus
-                        .read_u16(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as i16 as i64 as u64, // LH
-                    0x23 => bus
-                        .read_u32(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as i32 as i64 as u64, // LW
-                    0x24 => bus
-                        .read_u8(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as u64, // LBU
-                    0x25 => bus
-                        .read_u16(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as u64, // LHU
-                    0x27 => bus
-                        .read_u32(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?
-                        as u64, // LWU
-                    0x37 => bus
-                        .read_u64(address)
-                        .map_err(|source| bus_access(instruction_pc, source))?, // LD
-                    _ => unreachable!(),
-                };
+                check_alignment(instruction_pc, address, bytes, false)?;
+                let value =
+                    match opcode {
+                        0x20 => bus.read_u8(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as i8 as i64 as u64, // LB
+                        0x21 => bus.read_u16(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as i16 as i64 as u64, // LH
+                        0x23 => bus.read_u32(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as i32 as i64 as u64, // LW
+                        0x24 => bus.read_u8(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as u64, // LBU
+                        0x25 => bus.read_u16(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as u64, // LHU
+                        0x27 => bus.read_u32(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })? as u64, // LWU
+                        0x37 => bus.read_u64(address).map_err(|source| {
+                            bus_access(instruction_pc, source, BusAccessKind::Load)
+                        })?, // LD
+                        _ => unreachable!(),
+                    };
                 self.write_gpr(rt, value);
             }
             0x28 | 0x29 | 0x2B | 0x3F => {
@@ -213,7 +364,7 @@ impl Cpu {
                     0x3F => 8, // SD
                     _ => unreachable!(),
                 };
-                check_alignment(instruction_pc, address, bytes)?;
+                check_alignment(instruction_pc, address, bytes, true)?;
                 let value = self.read_gpr(rt);
                 let result = match opcode {
                     0x28 => bus.write_u8(address, value as u8),
@@ -222,7 +373,8 @@ impl Cpu {
                     0x3F => bus.write_u64(address, value),
                     _ => unreachable!(),
                 };
-                result.map_err(|source| bus_access(instruction_pc, source))?;
+                result
+                    .map_err(|source| bus_access(instruction_pc, source, BusAccessKind::Store))?;
             }
             0x18 => {
                 let lhs = self.read_gpr(rs) as i64;
@@ -239,6 +391,7 @@ impl Cpu {
 
         self.pc = self.next_pc;
         self.next_pc = branch_target.unwrap_or(next_pc);
+        self.in_delay_slot = has_delay_slot;
         Ok(())
     }
 
@@ -322,6 +475,18 @@ impl Cpu {
             0x3C => self.write_gpr(rd, rhs << (shift + 32)),
             0x3E => self.write_gpr(rd, rhs >> (shift + 32)),
             0x3F => self.write_gpr(rd, ((rhs as i64) >> (shift + 32)) as u64),
+            0x0C => {
+                return Err(CpuError::GuestException {
+                    pc: instruction_pc,
+                    code: ExceptionCode::Syscall,
+                });
+            }
+            0x0D => {
+                return Err(CpuError::GuestException {
+                    pc: instruction_pc,
+                    code: ExceptionCode::Breakpoint,
+                });
+            }
             _ => return Err(unsupported(instruction_pc, instruction)),
         }
 
@@ -337,16 +502,21 @@ fn effective_address(base: u64, signed_immediate: i64) -> u32 {
     base.wrapping_add(signed_immediate as u64) as u32
 }
 
-fn check_alignment(pc: u64, address: u32, bytes: u8) -> Result<(), CpuError> {
+fn check_alignment(pc: u64, address: u32, bytes: u8, write: bool) -> Result<(), CpuError> {
     if address % bytes as u32 == 0 {
         Ok(())
     } else {
-        Err(CpuError::MisalignedMemoryAccess { pc, address, bytes })
+        Err(CpuError::MisalignedMemoryAccess {
+            pc,
+            address,
+            bytes,
+            write,
+        })
     }
 }
 
-fn bus_access(pc: u64, source: BusError) -> CpuError {
-    CpuError::BusAccess { pc, source }
+fn bus_access(pc: u64, source: BusError, kind: BusAccessKind) -> CpuError {
+    CpuError::BusAccess { pc, source, kind }
 }
 
 fn branch_address(instruction_pc: u64, immediate: u16) -> u64 {
@@ -528,133 +698,194 @@ mod tests {
     }
 
     #[test]
-    fn misaligned_word_load_reports_an_error_without_advancing_pc() {
+    fn misaligned_word_load_raises_address_error_and_records_bad_address() {
         let (mut cpu, mut bus) = system(&[i_type(0x23, 1, 2, 1)]);
         cpu.write_gpr(1, 0x8000_0100);
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::MisalignedMemoryAccess {
-                pc: ENTRY as u64,
-                address: 0x8000_0101,
-                bytes: 4,
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::AddressLoad,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64);
+        assert_eq!(cpu.cp0.bad_vaddr, 0x8000_0101);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 4);
+        assert_ne!(cpu.cp0.status & (1 << 1), 0);
+        assert_eq!(cpu.pc, 0x8000_0180);
     }
 
     #[test]
-    fn unmapped_load_propagates_the_bus_error_to_the_cpu() {
+    fn unmapped_load_raises_data_bus_error() {
         let (mut cpu, mut bus) = system(&[i_type(0x23, 1, 2, 0)]);
         cpu.write_gpr(1, 0x0800_0000);
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::BusAccess {
-                pc: ENTRY as u64,
-                source: BusError::UnmappedRead {
-                    address: 0x0800_0000,
-                    bytes: 4,
-                },
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::DataBusError,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 7);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
+        assert_eq!(cpu.pc, 0x8000_0180);
     }
 
     #[test]
-    fn store_to_cartridge_rom_reports_read_only_bus_error() {
+    fn store_to_cartridge_rom_raises_data_bus_error() {
         let (mut cpu, mut bus) = system(&[i_type(0x2B, 1, 2, 0)]);
         cpu.write_gpr(1, 0x1000_0010);
         cpu.write_gpr(2, 0x1234_5678);
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::BusAccess {
-                pc: ENTRY as u64,
-                source: BusError::ReadOnlyWrite {
-                    address: 0x1000_0010,
-                    bytes: 4,
-                },
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::DataBusError,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 7);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
     }
 
     #[test]
-    fn instruction_fetch_from_unmapped_address_returns_bus_error() {
+    fn instruction_fetch_from_unmapped_address_raises_instruction_bus_error() {
         let (mut cpu, mut bus) = system(&[]);
         cpu.pc = 0x0800_0000;
         cpu.next_pc = cpu.pc + 4;
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::BusAccess {
-                pc: 0x0800_0000,
-                source: BusError::UnmappedRead {
-                    address: 0x0800_0000,
-                    bytes: 4,
-                },
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::InstructionBusError,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, 0x0800_0000);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 6);
+        assert_eq!(cpu.cp0.epc, 0x0800_0000);
     }
 
     #[test]
-    fn misaligned_instruction_fetch_reports_a_cpu_error() {
+    fn misaligned_instruction_fetch_raises_address_error() {
         let (mut cpu, mut bus) = system(&[]);
         cpu.pc = ENTRY as u64 + 2;
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::MisalignedInstructionFetch {
-                pc: ENTRY as u64 + 2,
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::AddressLoad,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64 + 2);
+        assert_eq!(cpu.cp0.bad_vaddr, ENTRY as u64 + 2);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64 + 2);
     }
 
     #[test]
-    fn signed_add_overflow_returns_an_error_without_advancing_pc() {
+    fn signed_add_overflow_raises_overflow_exception() {
         let (mut cpu, mut bus) = system(&[r_type(1, 2, 3, 0, 0x20)]);
         cpu.write_gpr(1, i32::MAX as u64);
         cpu.write_gpr(2, 1);
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::ArithmeticOverflow {
-                pc: ENTRY as u64,
-                instruction: r_type(1, 2, 3, 0, 0x20),
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::ArithmeticOverflow,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 12);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
     }
 
     #[test]
-    fn unsupported_instruction_returns_an_error_without_advancing_pc() {
-        let instruction = 0x4000_0000; // COP0 ainda não implementado
+    fn unsupported_instruction_raises_reserved_instruction_exception() {
+        let instruction = 0x4000_0000; // Coprocessador ainda não implementado
         let (mut cpu, mut bus) = system(&[instruction]);
 
-        let error = cpu.step(&mut bus).unwrap_err();
-
         assert_eq!(
-            error,
-            CpuError::UnsupportedInstruction {
-                pc: ENTRY as u64,
-                instruction,
+            cpu.step(&mut bus).unwrap(),
+            StepOutcome::Exception {
+                code: ExceptionCode::ReservedInstruction,
+                vector: 0x8000_0180,
             }
         );
-        assert_eq!(cpu.pc, ENTRY as u64);
+        assert_eq!((cpu.cp0.cause >> 2) & 0x1F, 10);
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
+        assert_eq!(cpu.pc, 0x8000_0180);
+    }
+
+    #[test]
+    fn exception_in_branch_delay_slot_records_branch_pc_and_bd_bit() {
+        let instructions = [
+            i_type(0x04, 1, 1, 2), // BEQ
+            0x4000_0000,           // instrução inválida no delay slot
+            0,
+            0,
+        ];
+        let (mut cpu, mut bus) = system(&instructions);
+        cpu.write_gpr(1, 7);
+
+        cpu.step(&mut bus).unwrap();
+        let outcome = cpu.step(&mut bus).unwrap();
+
+        assert_eq!(
+            outcome,
+            StepOutcome::Exception {
+                code: ExceptionCode::ReservedInstruction,
+                vector: 0x8000_0180,
+            }
+        );
+        assert_eq!(cpu.cp0.epc, ENTRY as u64);
+        assert_ne!(cpu.cp0.cause & (1 << 31), 0);
+    }
+
+    #[test]
+    fn exception_keeps_existing_epc_when_exl_is_already_set() {
+        let (mut cpu, mut bus) = system(&[0x4000_0000]);
+        cpu.cp0.status |= 1 << 1;
+        cpu.cp0.epc = 0x8123_4560;
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.cp0.epc, 0x8123_4560);
+    }
+
+    #[test]
+    fn bootstrap_vector_is_used_when_bev_is_set() {
+        let (mut cpu, mut bus) = system(&[0x4000_0000]);
+        cpu.cp0.status |= 1 << 22;
+
+        let outcome = cpu.step(&mut bus).unwrap();
+
+        assert_eq!(
+            outcome,
+            StepOutcome::Exception {
+                code: ExceptionCode::ReservedInstruction,
+                vector: 0xBFC0_0380,
+            }
+        );
+    }
+
+    #[test]
+    fn syscall_and_break_raise_their_architectural_exceptions() {
+        for (function, expected) in [
+            (0x0C, ExceptionCode::Syscall),
+            (0x0D, ExceptionCode::Breakpoint),
+        ] {
+            let (mut cpu, mut bus) = system(&[r_type(0, 0, 0, 0, function)]);
+
+            assert_eq!(
+                cpu.step(&mut bus).unwrap(),
+                StepOutcome::Exception {
+                    code: expected,
+                    vector: 0x8000_0180,
+                }
+            );
+            assert_eq!((cpu.cp0.cause >> 2) & 0x1F, expected as u64);
+            assert_eq!(cpu.cp0.epc, ENTRY as u64);
+        }
     }
 }
